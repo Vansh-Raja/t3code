@@ -1067,3 +1067,86 @@ it.effect("admits provider and OAuth client credentials and points only clients 
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
+
+it.effect(
+  "serves in-session requests that omit MCP-Protocol-Version at the negotiated version",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const token = "providerTokenWithoutDots";
+        const scope: McpInvocationContext.McpInvocationScope = {
+          environmentId,
+          requestNamespace: "provider-session",
+          thread: {
+            threadId: ThreadId.make("thread-provider"),
+            providerSessionId: "provider-session",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+          },
+          client: undefined,
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 1,
+        };
+        const ProbeToolkit = Toolkit.make(
+          Tool.make("probe", {
+            description: "Answers ok.",
+            success: Schema.Struct({ ok: Schema.Boolean }),
+            failure: OrchestratorMcpFailure,
+            failureMode: "return",
+          }),
+        );
+        const serverLayer = McpHttpServer.toolkitRegistration(
+          ProbeToolkit,
+          McpToolAccess.toLayer(ProbeToolkit, {
+            probe: McpToolAccess.reads(() => Effect.succeed({ ok: true })),
+          }),
+        ).pipe(
+          Layer.provideMerge(McpHttpServer.layerMcpTransport),
+          Layer.provide(
+            Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+              resolve: (presented) =>
+                Effect.succeed(
+                  presented === token
+                    ? (scope as McpInvocationContext.McpThreadInvocationScope)
+                    : undefined,
+                ),
+            }),
+          ),
+        );
+        yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
+          Layer.build,
+        );
+        const httpClient = yield* HttpClient.HttpClient;
+        const headers = {
+          accept: "application/json, text/event-stream",
+          authorization: `Bearer ${token}`,
+        };
+        const initialize = yield* httpClient.post("/mcp", {
+          headers,
+          body: HttpBody.text(
+            `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1.0.0"}}}`,
+            "application/json",
+          ),
+        });
+        expect(initialize.status).toBe(200);
+        const callProbe = (versionHeader: Record<string, string>) =>
+          httpClient.post("/mcp", {
+            headers: {
+              ...headers,
+              ...versionHeader,
+              "mcp-session-id": initialize.headers["mcp-session-id"]!,
+            },
+            body: HttpBody.text(
+              `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"probe","arguments":{}}}`,
+              "application/json",
+            ),
+          });
+
+        const withoutHeader = yield* callProbe({});
+        expect(withoutHeader.status).toBe(200);
+        expect(yield* withoutHeader.text).toContain('\\"ok\\":true');
+
+        const unsupported = yield* callProbe({ "mcp-protocol-version": "2026-07-28" });
+        expect(unsupported.status).toBe(400);
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);

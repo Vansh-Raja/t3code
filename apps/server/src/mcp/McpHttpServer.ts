@@ -12,7 +12,7 @@ import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import type * as Types from "effect/Types";
 import { AiError, McpProtocol, McpSchema, McpServer, Tool, type Toolkit } from "effect/ai";
-import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
+import { Headers, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { OrchestratorMcpFailure, PreviewAutomationError } from "@t3tools/contracts";
 
 import packageJson from "../../package.json" with { type: "json" };
@@ -144,6 +144,23 @@ export const normalizeMcpHttpResponse = (
 // Session tokens are `<payload>.<signature>`; registry tokens are a bare base64url secret.
 const looksLikeProviderToken = (token: string) => token.length > 0 && !token.includes(".");
 
+const mcpProtocol = McpProtocol.v2025_06_18;
+
+/**
+ * Gives an in-session request without `MCP-Protocol-Version` the version its
+ * session negotiated, as the MCP spec allows. effect@4.0.1 answers these with
+ * an empty 400 instead, and Grok Bot sends the header only on `initialize`, so
+ * none of its tool calls ran. T3 offers a single protocol, so every session
+ * negotiated `mcpProtocol`. Drop this once effect is at 4.0.2 or later.
+ */
+const withNegotiatedProtocolVersion = (request: HttpServerRequest.HttpServerRequest) =>
+  request.headers["mcp-session-id"] !== undefined &&
+  request.headers["mcp-protocol-version"] === undefined
+    ? request.modify({
+        headers: Headers.set(request.headers, "mcp-protocol-version", mcpProtocol.protocolVersion),
+      })
+    : request;
+
 const makeMcpAuthMiddleware = Effect.gen(function* () {
   const registry = yield* McpSessionRegistry.McpSessionRegistry;
   const clients = yield* Effect.serviceOption(McpClientAuthenticator);
@@ -173,6 +190,10 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
       });
     }
     return yield* httpEffect.pipe(
+      Effect.provideService(
+        HttpServerRequest.HttpServerRequest,
+        withNegotiatedProtocolVersion(request),
+      ),
       Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
       Effect.map(normalizeMcpHttpResponse),
     );
@@ -844,7 +865,7 @@ export const layerMcpTransport = McpServer.layerHttp({
   name: "T3 Code",
   version: packageJson.version,
   path: "/mcp",
-  protocols: [McpProtocol.v2025_06_18],
+  protocols: [mcpProtocol],
 }).pipe(Layer.provide(layerMcpAuthMiddleware));
 
 export const layer = Layer.mergeAll(
